@@ -1,4 +1,5 @@
 import torch
+torch.set_num_threads(1)
 
 from fastapi import FastAPI, Form, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
@@ -15,6 +16,8 @@ import docx
 import re
 from typing import Optional, Set, Dict, List
 import json
+import asyncio
+from functools import partial
 
 try:
     import fitz
@@ -58,7 +61,6 @@ FOR_LABEL = 1
 MAX_CHUNKS = int(os.getenv("MAX_CHUNKS", "50"))
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
-print(f"Running on device: {device}")
 
 emb_tokenizer = AutoTokenizer.from_pretrained(EMBED_MODEL_NAME)
 emb_model = AutoModel.from_pretrained(EMBED_MODEL_NAME).to(device).eval()
@@ -82,13 +84,7 @@ if LABEL_MAP:
         if "AGAINST" in label:
             AGAINST_INDEX = idx
 
-print("Classifier num_labels:", NUM_LABELS)
-print("Label map:", LABEL_MAP or "(none)")
-print("Using FOR_INDEX:", FOR_INDEX, "AGAINST_INDEX:", AGAINST_INDEX)
-print("FLIP_LABELS:", FLIP_LABELS)
-
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
-print("OpenAI client ready:", bool(client))
 
 DATA_DIR = "/app/data"
 DF_PATH = os.getenv("POLICY_CSV", f"{DATA_DIR}/investor_rem_policies.csv")
@@ -102,20 +98,16 @@ CSV_MAP = {
     "leg": os.getenv("LEG_CSV", f"{DATA_DIR}/leg_against_votes.csv"),
 }
 
-
 def _tokenize_name(s: str) -> List[str]:
     return [t for t in re.findall(r"[A-Za-z0-9]+", str(s).lower()) if t]
 
-
 def normalize_name(s: str) -> str:
     return re.sub(r"[^a-z0-9]", "", s.lower())
-
 
 def _prefix_key_from_tokens(tokens: List[str]) -> str:
     if not tokens:
         return ""
     return " ".join(tokens[:2]) if len(tokens) >= 2 else tokens[0]
-
 
 INVESTOR_PREFIX_INDEX: Dict[str, Set[str]] = {}
 for inv_name in investor_policies.keys():
@@ -128,7 +120,6 @@ for inv_name in investor_policies.keys():
         if not k:
             continue
         INVESTOR_PREFIX_INDEX.setdefault(k, set()).add(inv_name)
-
 
 def _pick_manager_col(df_csv: pd.DataFrame) -> Optional[str]:
     lower = {c.lower(): c for c in df_csv.columns}
@@ -145,7 +136,6 @@ def _pick_manager_col(df_csv: pd.DataFrame) -> Optional[str]:
             return c
     return None
 
-
 def _filter_against_rows(df_csv: pd.DataFrame) -> pd.DataFrame:
     lower = {c.lower(): c for c in df_csv.columns}
     vote_candidates = ["vote", "decision", "voteresult", "vote result", "resolution vote", "voted"]
@@ -159,9 +149,10 @@ def _filter_against_rows(df_csv: pd.DataFrame) -> pd.DataFrame:
             break
     return df_csv
 
-
 def load_company_against_investors_from_csv(csv_path: str) -> Set[str]:
     matched: Set[str] = set()
+    if not os.path.exists(csv_path):
+        return matched
     try:
         df_csv = pd.read_csv(csv_path)
     except Exception:
@@ -186,9 +177,52 @@ def load_company_against_investors_from_csv(csv_path: str) -> Set[str]:
             if invs:
                 matched.update(invs)
                 break
-
     return matched
 
+PRELOADED_AGAINST_MAP: Dict[str, Set[str]] = {}
+for key, path in CSV_MAP.items():
+    if path:
+        PRELOADED_AGAINST_MAP[key] = load_company_against_investors_from_csv(path)
+
+def _mean_pool(last_hidden_state: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+    masked = last_hidden_state * attention_mask.unsqueeze(-1)
+    lengths = attention_mask.sum(dim=1, keepdim=True).clamp_min(1)
+    return masked.sum(dim=1) / lengths
+
+@torch.no_grad()
+def get_embeddings(texts, batch_size: int = 32, max_length: int = 512):
+    if not isinstance(texts, (list, tuple)):
+        texts = [texts]
+    all_vecs = []
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i : i + batch_size]
+        enc = emb_tokenizer(
+            batch,
+            return_tensors="pt",
+            truncation=True,
+            padding=True,
+            max_length=max_length,
+        ).to(device)
+        outputs = emb_model(**enc)
+        sent_emb = _mean_pool(outputs.last_hidden_state, enc["attention_mask"])
+        sent_emb = torch.nn.functional.normalize(sent_emb, p=2, dim=1)
+        all_vecs.append(sent_emb.cpu())
+    if not all_vecs:
+        return np.array([])
+    return torch.cat(all_vecs, dim=0).numpy()
+
+def get_embedding(text: str):
+    return get_embeddings([text])[0]
+
+INVESTOR_EMBEDDINGS: Dict[str, np.ndarray] = {}
+print("Pre-computing investor policy embeddings...")
+_all_policies = list(investor_policies.values())
+_all_policy_names = list(investor_policies.keys())
+if _all_policies:
+    _embs = get_embeddings(_all_policies, batch_size=32)
+    for _name, _emb in zip(_all_policy_names, _embs):
+        INVESTOR_EMBEDDINGS[_name] = _emb
+print("Done pre-computing embeddings.")
 
 app = FastAPI()
 
@@ -200,10 +234,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 def escape_html(s: str) -> str:
     return html.escape(s).replace("\n", "<br>")
-
 
 def extract_text_from_docx_bytes(data: bytes) -> str:
     document = docx.Document(BytesIO(data))
@@ -214,7 +246,6 @@ def extract_text_from_docx_bytes(data: bytes) -> str:
             if cells:
                 paras.append("\t".join(cells))
     return "\n".join(paras)
-
 
 def extract_text_from_pdf_bytes(data: bytes) -> str:
     if fitz is not None:
@@ -257,39 +288,7 @@ def extract_text_from_pdf_bytes(data: bytes) -> str:
             return "\n".join(out)
         except Exception:
             pass
-    raise RuntimeError("Unable to extract text from PDF. Install PyMuPDF, pdfminer.six, or ensure OCR tools are available.")
-
-
-def _mean_pool(last_hidden_state: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-    masked = last_hidden_state * attention_mask.unsqueeze(-1)
-    lengths = attention_mask.sum(dim=1, keepdim=True).clamp_min(1)
-    return masked.sum(dim=1) / lengths
-
-
-@torch.no_grad()
-def get_embeddings(texts, batch_size: int = 32, max_length: int = 512):
-    if not isinstance(texts, (list, tuple)):
-        texts = [texts]
-    all_vecs = []
-    for i in range(0, len(texts), batch_size):
-        batch = texts[i : i + batch_size]
-        enc = emb_tokenizer(
-            batch,
-            return_tensors="pt",
-            truncation=True,
-            padding=True,
-            max_length=max_length,
-        ).to(device)
-        outputs = emb_model(**enc)
-        sent_emb = _mean_pool(outputs.last_hidden_state, enc["attention_mask"])
-        sent_emb = torch.nn.functional.normalize(sent_emb, p=2, dim=1)
-        all_vecs.append(sent_emb.cpu())
-    return torch.cat(all_vecs, dim=0).numpy()
-
-
-def get_embedding(text: str):
-    return get_embeddings([text])[0]
-
+    raise RuntimeError("Unable to extract text from PDF.")
 
 def chunk_text(text: str, max_tokens: int = 512, stride: int = 256, min_tokens: int = 16):
     original_max = getattr(emb_tokenizer, "model_max_length", 512)
@@ -309,7 +308,6 @@ def chunk_text(text: str, max_tokens: int = 512, stride: int = 256, min_tokens: 
         if start + max_tokens >= len(ids):
             break
     return chunks
-
 
 @torch.no_grad()
 def predict_votes_batch(policy: str, chunks: List[str], max_length: int = 512):
@@ -354,7 +352,6 @@ def predict_votes_batch(policy: str, chunks: List[str], max_length: int = 512):
             
     return results
 
-
 def weighted_decision(scored, sims):
     votes = np.array([v for _, v, _ in scored], dtype=float)
     probs = np.array([p for _, _, p in scored], dtype=float)
@@ -369,7 +366,6 @@ def weighted_decision(scored, sims):
     maj = AGAINST_LABEL if weighted_frac_against >= AGAINST_THRESHOLD else FOR_LABEL
     conf = abs(weighted_mean_prob_against - 0.5)
     return maj, conf, weighted_frac_against, weighted_mean_prob_against
-
 
 def get_gpt_reason(policy_text: str, chunks: List[str]):
     if client is None:
@@ -395,7 +391,6 @@ def get_gpt_reason(policy_text: str, chunks: List[str]):
         return response.choices[0].message.content.strip()
     except Exception as e:
         return f"(GPT error: {html.escape(str(e))})"
-
 
 def stream_gpt_reason(policy_text: str, chunks: List[str]):
     if client is None:
@@ -431,7 +426,6 @@ def stream_gpt_reason(policy_text: str, chunks: List[str]):
     except Exception as e:
         yield f"(GPT error: {str(e)})"
 
-
 def compute_investor_decision(
     name: str,
     investor_policy: str,
@@ -439,7 +433,10 @@ def compute_investor_decision(
     chunk_embeddings: np.ndarray,
     force_reason: bool = False,
 ):
-    policy_emb = get_embedding(investor_policy)
+    policy_emb = INVESTOR_EMBEDDINGS.get(name)
+    if policy_emb is None:
+        policy_emb = get_embedding(investor_policy)
+        
     sims = chunk_embeddings @ policy_emb
     top_idx = np.argsort(sims)[-TOP_K:][::-1]
     top_chunks = [chunks[i] for i in top_idx]
@@ -462,7 +459,6 @@ def compute_investor_decision(
         "confidence": conf,
     }
     return base, top_chunks
-
 
 def analyze_investor_single(
     name: str,
@@ -490,62 +486,45 @@ def analyze_investor_single(
     result["reason"] = reason_text
     return result
 
-
 @app.get("/healthz")
 def healthz():
-    return {"status": "ok", "device": device}
-
+    return {"status": "All Ok", "device": device}
 
 @app.get("/investors")
 def investors():
     return list(investor_policies.keys())
-
 
 @app.post("/analyze")
 async def analyze_document(
     file: UploadFile = File(...),
     policy: str = Form("all"),
 ):
-    print("Request start")
     contents = await file.read()
     filename = (file.filename or "").lower()
-    print(filename)
-    base = os.path.splitext(os.path.basename(filename))[0]
+    
+    base_name = os.path.splitext(os.path.basename(filename))[0]
     company_key = None
-    if "autotrader" in base:
+    if "autotrader" in base_name:
         company_key = "autotrader"
-    elif "unilever" in base:
+    elif "unilever" in base_name:
         company_key = "unilever"
-    elif "leg" in base:
+    elif "leg" in base_name:
         company_key = "leg"
-    elif "sainsbury" in base or "sainsbury's" in base or "j sainsbury" in base:
+    elif "sainsbury" in base_name or "sainsbury's" in base_name or "j sainsbury" in base_name:
         company_key = "sainsbury"
 
-    csv_force_reason_investors: Set[str] = set()
-    if company_key:
-        csv_path = CSV_MAP.get(company_key)
-        if csv_path and os.path.exists(csv_path):
-            try:
-                csv_force_reason_investors = load_company_against_investors_from_csv(csv_path)
-                print(f"[CSV] Matched {len(csv_force_reason_investors)} investors from {csv_path}")
-            except Exception as _e:
-                print(f"[CSV] Failed to load {csv_path}: {_e}")
-        else:
-            print(f"[CSV] No CSV available or path missing for company '{company_key}'")
+    csv_force_reason_investors = PRELOADED_AGAINST_MAP.get(company_key, set())
 
+    loop = asyncio.get_running_loop()
     try:
         if filename.endswith(".docx"):
-            full_text = extract_text_from_docx_bytes(contents)
+            full_text = await loop.run_in_executor(None, extract_text_from_docx_bytes, contents)
         elif filename.endswith(".pdf"):
-            full_text = extract_text_from_pdf_bytes(contents)
+            full_text = await loop.run_in_executor(None, extract_text_from_pdf_bytes, contents)
         else:
-            return {
-                "error": f"Unsupported file type: {filename}. Please upload .docx or .pdf.",
-            }
+            return {"error": f"Unsupported file type: {filename}. Please upload .docx or .pdf."}
     except Exception as e:
-        return {
-            "error": f"Error extracting text: {str(e)}",
-        }
+        return {"error": f"Error extracting text: {str(e)}"}
 
     if not full_text.strip():
         return {"error": "No readable text found in document."}
@@ -594,52 +573,37 @@ async def analyze_document(
         "results": results,
     }
 
-
 @app.post("/analyze-stream")
 async def analyze_document_stream(
     file: UploadFile = File(...),
     policies: str = Form("all"),
 ):
-    print("Streaming request start")
     contents = await file.read()
     filename = (file.filename or "").lower()
-    print(filename)
-    base = os.path.splitext(os.path.basename(filename))[0]
+    
+    base_name = os.path.splitext(os.path.basename(filename))[0]
     company_key = None
-    if "autotrader" in base:
+    if "autotrader" in base_name:
         company_key = "autotrader"
-    elif "unilever" in base:
+    elif "unilever" in base_name:
         company_key = "unilever"
-    elif "leg" in base:
+    elif "leg" in base_name:
         company_key = "leg"
-    elif "sainsbury" in base or "sainsbury's" in base or "j sainsbury" in base:
+    elif "sainsbury" in base_name or "sainsbury's" in base_name or "j sainsbury" in base_name:
         company_key = "sainsbury"
 
-    csv_force_reason_investors: Set[str] = set()
-    if company_key:
-        csv_path = CSV_MAP.get(company_key)
-        if csv_path and os.path.exists(csv_path):
-            try:
-                csv_force_reason_investors = load_company_against_investors_from_csv(csv_path)
-                print(f"[CSV] Matched {len(csv_force_reason_investors)} investors from {csv_path}")
-            except Exception as _e:
-                print(f"[CSV] Failed to load {csv_path}: {_e}")
-        else:
-            print(f"[CSV] No CSV available or path missing for company '{company_key}'")
+    csv_force_reason_investors = PRELOADED_AGAINST_MAP.get(company_key, set())
 
+    loop = asyncio.get_running_loop()
     try:
         if filename.endswith(".docx"):
-            full_text = extract_text_from_docx_bytes(contents)
+            full_text = await loop.run_in_executor(None, extract_text_from_docx_bytes, contents)
         elif filename.endswith(".pdf"):
-            full_text = extract_text_from_pdf_bytes(contents)
+            full_text = await loop.run_in_executor(None, extract_text_from_pdf_bytes, contents)
         else:
-            return {
-                "error": f"Unsupported file type: {filename}. Please upload .docx or .pdf.",
-            }
+            return {"error": f"Unsupported file type: {filename}. Please upload .docx or .pdf."}
     except Exception as e:
-        return {
-            "error": f"Error extracting text: {str(e)}",
-        }
+        return {"error": f"Error extracting text: {str(e)}"}
 
     if not full_text.strip():
         return {"error": "No readable text found in document."}
@@ -658,26 +622,19 @@ async def analyze_document_stream(
         investor_list = list(investor_policies.keys())
     else:
         requested_raw = [p.strip() for p in policies.split("@") if p.strip()]
-        
         normalized_map = {normalize_name(k): k for k in investor_policies.keys()}
-
         investor_list = []
         unknown = []
-
         for req in requested_raw:
             key = normalize_name(req)
-
             if key in normalized_map:
                 investor_list.append(normalized_map[key])
                 continue
-
             matches = [full for norm, full in normalized_map.items() if norm.startswith(key)]
             if matches:
                 investor_list.append(matches[0])
                 continue
-
             unknown.append(req)
-
         if unknown:
             return {"error": f"Unknown investor(s): {', '.join(unknown)}"}
 
