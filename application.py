@@ -19,8 +19,6 @@ import re
 from typing import Optional, Set, Dict, List
 import json
 
-# --- LOGGING SETUP ---
-# Force logs to output immediately (flush) so you see them in 'tail -f'
 logging.basicConfig(
     level=logging.INFO, 
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -69,7 +67,7 @@ FLIP_LABELS = os.getenv("FLIP_LABELS", "1").strip() not in {"0", "false", "False
 AGAINST_LABEL = 0
 FOR_LABEL = 1
 
-MAX_CHUNKS = int(os.getenv("MAX_CHUNKS", "50"))
+MAX_CHUNKS = int(os.getenv("MAX_CHUNKS", "300"))
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 logger.info(f"Running on device: {device}")
@@ -121,20 +119,16 @@ CSV_MAP = {
     "leg": os.getenv("LEG_CSV", f"{DATA_DIR}/leg_against_votes.csv"),
 }
 
-
 def _tokenize_name(s: str) -> List[str]:
     return [t for t in re.findall(r"[A-Za-z0-9]+", str(s).lower()) if t]
 
-
 def normalize_name(s: str) -> str:
     return re.sub(r"[^a-z0-9]", "", s.lower())
-
 
 def _prefix_key_from_tokens(tokens: List[str]) -> str:
     if not tokens:
         return ""
     return " ".join(tokens[:2]) if len(tokens) >= 2 else tokens[0]
-
 
 INVESTOR_PREFIX_INDEX: Dict[str, Set[str]] = {}
 for inv_name in investor_policies.keys():
@@ -147,7 +141,6 @@ for inv_name in investor_policies.keys():
         if not k:
             continue
         INVESTOR_PREFIX_INDEX.setdefault(k, set()).add(inv_name)
-
 
 def _pick_manager_col(df_csv: pd.DataFrame) -> Optional[str]:
     lower = {c.lower(): c for c in df_csv.columns}
@@ -164,7 +157,6 @@ def _pick_manager_col(df_csv: pd.DataFrame) -> Optional[str]:
             return c
     return None
 
-
 def _filter_against_rows(df_csv: pd.DataFrame) -> pd.DataFrame:
     lower = {c.lower(): c for c in df_csv.columns}
     vote_candidates = ["vote", "decision", "voteresult", "vote result", "resolution vote", "voted"]
@@ -177,7 +169,6 @@ def _filter_against_rows(df_csv: pd.DataFrame) -> pd.DataFrame:
                 return df_csv[mask]
             break
     return df_csv
-
 
 def load_company_against_investors_from_csv(csv_path: str) -> Set[str]:
     matched: Set[str] = set()
@@ -208,6 +199,44 @@ def load_company_against_investors_from_csv(csv_path: str) -> Set[str]:
 
     return matched
 
+def _mean_pool(last_hidden_state: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+    masked = last_hidden_state * attention_mask.unsqueeze(-1)
+    lengths = attention_mask.sum(dim=1, keepdim=True).clamp_min(1)
+    return masked.sum(dim=1) / lengths
+
+@torch.no_grad()
+def get_embeddings(texts, batch_size: int = 32, max_length: int = 512):
+    if not isinstance(texts, (list, tuple)):
+        texts = [texts]
+    all_vecs = []
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i : i + batch_size]
+        enc = emb_tokenizer(
+            batch,
+            return_tensors="pt",
+            truncation=True,
+            padding=True,
+            max_length=max_length,
+        ).to(device)
+        outputs = emb_model(**enc)
+        sent_emb = _mean_pool(outputs.last_hidden_state, enc["attention_mask"])
+        sent_emb = torch.nn.functional.normalize(sent_emb, p=2, dim=1)
+        all_vecs.append(sent_emb.cpu())
+    return torch.cat(all_vecs, dim=0).numpy()
+
+def get_embedding(text: str):
+    return get_embeddings([text])[0]
+
+logger.info("Pre-computing investor policy embeddings...")
+INVESTOR_EMBS: Dict[str, np.ndarray] = {}
+with torch.no_grad():
+    if investor_policies:
+        names = list(investor_policies.keys())
+        texts = list(investor_policies.values())
+        vecs = get_embeddings(texts, batch_size=32)
+        for name, vec in zip(names, vecs):
+            INVESTOR_EMBS[name] = vec
+logger.info(f"Cached {len(INVESTOR_EMBS)} investor policies.")
 
 app = FastAPI()
 
@@ -219,10 +248,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 def escape_html(s: str) -> str:
     return html.escape(s).replace("\n", "<br>")
-
 
 def extract_text_from_docx_bytes(data: bytes) -> str:
     document = docx.Document(BytesIO(data))
@@ -233,7 +260,6 @@ def extract_text_from_docx_bytes(data: bytes) -> str:
             if cells:
                 paras.append("\t".join(cells))
     return "\n".join(paras)
-
 
 def extract_text_from_pdf_bytes(data: bytes) -> str:
     if fitz is not None:
@@ -278,38 +304,6 @@ def extract_text_from_pdf_bytes(data: bytes) -> str:
             pass
     raise RuntimeError("Unable to extract text from PDF. Install PyMuPDF, pdfminer.six, or ensure OCR tools are available.")
 
-
-def _mean_pool(last_hidden_state: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-    masked = last_hidden_state * attention_mask.unsqueeze(-1)
-    lengths = attention_mask.sum(dim=1, keepdim=True).clamp_min(1)
-    return masked.sum(dim=1) / lengths
-
-
-@torch.no_grad()
-def get_embeddings(texts, batch_size: int = 32, max_length: int = 512):
-    if not isinstance(texts, (list, tuple)):
-        texts = [texts]
-    all_vecs = []
-    for i in range(0, len(texts), batch_size):
-        batch = texts[i : i + batch_size]
-        enc = emb_tokenizer(
-            batch,
-            return_tensors="pt",
-            truncation=True,
-            padding=True,
-            max_length=max_length,
-        ).to(device)
-        outputs = emb_model(**enc)
-        sent_emb = _mean_pool(outputs.last_hidden_state, enc["attention_mask"])
-        sent_emb = torch.nn.functional.normalize(sent_emb, p=2, dim=1)
-        all_vecs.append(sent_emb.cpu())
-    return torch.cat(all_vecs, dim=0).numpy()
-
-
-def get_embedding(text: str):
-    return get_embeddings([text])[0]
-
-
 def chunk_text(text: str, max_tokens: int = 512, stride: int = 256, min_tokens: int = 16):
     original_max = getattr(emb_tokenizer, "model_max_length", 512)
     try:
@@ -328,7 +322,6 @@ def chunk_text(text: str, max_tokens: int = 512, stride: int = 256, min_tokens: 
         if start + max_tokens >= len(ids):
             break
     return chunks
-
 
 @torch.no_grad()
 def predict_votes_batch(policy: str, chunks: List[str], max_length: int = 512):
@@ -373,7 +366,6 @@ def predict_votes_batch(policy: str, chunks: List[str], max_length: int = 512):
             
     return results
 
-
 def weighted_decision(scored, sims):
     votes = np.array([v for _, v, _ in scored], dtype=float)
     probs = np.array([p for _, _, p in scored], dtype=float)
@@ -388,7 +380,6 @@ def weighted_decision(scored, sims):
     maj = AGAINST_LABEL if weighted_frac_against >= AGAINST_THRESHOLD else FOR_LABEL
     conf = abs(weighted_mean_prob_against - 0.5)
     return maj, conf, weighted_frac_against, weighted_mean_prob_against
-
 
 def get_gpt_reason(policy_text: str, chunks: List[str]):
     if client is None:
@@ -416,7 +407,6 @@ def get_gpt_reason(policy_text: str, chunks: List[str]):
         return response.choices[0].message.content.strip()
     except Exception as e:
         return f"(GPT error: {html.escape(str(e))})"
-
 
 def stream_gpt_reason(policy_text: str, chunks: List[str]):
     if client is None:
@@ -457,7 +447,6 @@ def stream_gpt_reason(policy_text: str, chunks: List[str]):
     except Exception as e:
         yield f"(GPT error: {str(e)})"
 
-
 def compute_investor_decision(
     name: str,
     investor_policy: str,
@@ -465,7 +454,10 @@ def compute_investor_decision(
     chunk_embeddings: np.ndarray,
     force_reason: bool = False,
 ):
-    policy_emb = get_embedding(investor_policy)
+    policy_emb = INVESTOR_EMBS.get(name)
+    if policy_emb is None:
+        policy_emb = get_embedding(investor_policy)
+
     sims = chunk_embeddings @ policy_emb
     top_idx = np.argsort(sims)[-TOP_K:][::-1]
     top_chunks = [chunks[i] for i in top_idx]
@@ -488,7 +480,6 @@ def compute_investor_decision(
         "confidence": conf,
     }
     return base, top_chunks
-
 
 def analyze_investor_single(
     name: str,
@@ -516,11 +507,9 @@ def analyze_investor_single(
     result["reason"] = reason_text
     return result
 
-
 @app.get("/healthz")
 def healthz():
     return {"status": "ok", "device": device}
-
 
 @app.get("/investors")
 def investors():
@@ -529,7 +518,6 @@ def investors():
     keys = list(investor_policies.keys())
     logger.info(f"Returning {len(keys)} investors. Took {time.time() - t_start:.4f}s")
     return keys
-
 
 @app.post("/analyze")
 async def analyze_document(
@@ -640,7 +628,6 @@ async def analyze_document(
         "policy": policy,
         "results": results,
     }
-
 
 @app.post("/analyze-stream")
 async def analyze_document_stream(
