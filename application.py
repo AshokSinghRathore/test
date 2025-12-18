@@ -1,4 +1,6 @@
 import torch
+import time
+import logging
 
 from fastapi import FastAPI, Form, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
@@ -15,6 +17,9 @@ import docx
 import re
 from typing import Optional, Set, Dict, List
 import json
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
 
 try:
     import fitz
@@ -58,7 +63,10 @@ FOR_LABEL = 1
 MAX_CHUNKS = int(os.getenv("MAX_CHUNKS", "50"))
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
-print(f"Running on device: {device}")
+logger.info(f"Running on device: {device}")
+
+logger.info("Loading models...")
+t_load_start = time.time()
 
 emb_tokenizer = AutoTokenizer.from_pretrained(EMBED_MODEL_NAME)
 emb_model = AutoModel.from_pretrained(EMBED_MODEL_NAME).to(device).eval()
@@ -66,6 +74,8 @@ emb_model = AutoModel.from_pretrained(EMBED_MODEL_NAME).to(device).eval()
 cls_tokenizer = AutoTokenizer.from_pretrained(CLS_MODEL_NAME)
 classifier_model = AutoModelForSequenceClassification.from_pretrained(CLS_MODEL_NAME).to(device).eval()
 NUM_LABELS = classifier_model.config.num_labels
+
+logger.info(f"Models loaded in {time.time() - t_load_start:.2f}s")
 
 LABEL_MAP: Dict[int, str] = {}
 try:
@@ -82,15 +92,15 @@ if LABEL_MAP:
         if "AGAINST" in label:
             AGAINST_INDEX = idx
 
-print("Classifier num_labels:", NUM_LABELS)
-print("Label map:", LABEL_MAP or "(none)")
-print("Using FOR_INDEX:", FOR_INDEX, "AGAINST_INDEX:", AGAINST_INDEX)
-print("FLIP_LABELS:", FLIP_LABELS)
+logger.info(f"Classifier num_labels: {NUM_LABELS}")
+logger.info(f"Label map: {LABEL_MAP or '(none)'}")
+logger.info(f"Using FOR_INDEX: {FOR_INDEX}, AGAINST_INDEX: {AGAINST_INDEX}")
+logger.info(f"FLIP_LABELS: {FLIP_LABELS}")
 
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
-print("OpenAI client ready:", bool(client))
+logger.info(f"OpenAI client ready: {bool(client)}")
 
-DATA_DIR = "/app/data"
+DATA_DIR = "/workspace"
 DF_PATH = os.getenv("POLICY_CSV", f"{DATA_DIR}/investor_rem_policies.csv")
 df = pd.read_csv(DF_PATH)
 investor_policies: Dict[str, str] = dict(zip(df["Investor"], df["RemunerationPolicy"]))
@@ -385,6 +395,7 @@ def get_gpt_reason(policy_text: str, chunks: List[str]):
         + "Why might this investor vote AGAINST this resolution? Please include specific references to the company report and the investor policy."
     )
     try:
+        t0 = time.time()
         response = client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=[
@@ -392,6 +403,7 @@ def get_gpt_reason(policy_text: str, chunks: List[str]):
                 {"role": "user", "content": prompt},
             ],
         )
+        logger.info(f"GPT request took {time.time() - t0:.2f}s")
         return response.choices[0].message.content.strip()
     except Exception as e:
         return f"(GPT error: {html.escape(str(e))})"
@@ -414,6 +426,7 @@ def stream_gpt_reason(policy_text: str, chunks: List[str]):
     )
 
     try:
+        t0 = time.time()
         stream = client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=[
@@ -422,7 +435,11 @@ def stream_gpt_reason(policy_text: str, chunks: List[str]):
             ],
             stream=True,
         )
+        first_chunk_received = False
         for chunk in stream:
+            if not first_chunk_received:
+                logger.info(f"GPT stream time to first token: {time.time() - t0:.2f}s")
+                first_chunk_received = True
             choice = chunk.choices[0]
             delta = getattr(choice, "delta", None)
             content = getattr(delta, "content", None) if delta is not None else None
@@ -506,10 +523,15 @@ async def analyze_document(
     file: UploadFile = File(...),
     policy: str = Form("all"),
 ):
-    print("Request start")
+    t_req_start = time.time()
+    logger.info("Request start: /analyze")
+    
+    t0 = time.time()
     contents = await file.read()
+    logger.info(f"File upload read took {time.time() - t0:.4f}s")
+
     filename = (file.filename or "").lower()
-    print(filename)
+    logger.info(f"Processing filename: {filename}")
     base = os.path.splitext(os.path.basename(filename))[0]
     company_key = None
     if "autotrader" in base:
@@ -526,14 +548,16 @@ async def analyze_document(
         csv_path = CSV_MAP.get(company_key)
         if csv_path and os.path.exists(csv_path):
             try:
+                t0 = time.time()
                 csv_force_reason_investors = load_company_against_investors_from_csv(csv_path)
-                print(f"[CSV] Matched {len(csv_force_reason_investors)} investors from {csv_path}")
+                logger.info(f"[CSV] Loaded {len(csv_force_reason_investors)} investors in {time.time() - t0:.4f}s")
             except Exception as _e:
-                print(f"[CSV] Failed to load {csv_path}: {_e}")
+                logger.error(f"[CSV] Failed to load {csv_path}: {_e}")
         else:
-            print(f"[CSV] No CSV available or path missing for company '{company_key}'")
+            logger.warning(f"[CSV] No CSV available or path missing for company '{company_key}'")
 
     try:
+        t0 = time.time()
         if filename.endswith(".docx"):
             full_text = extract_text_from_docx_bytes(contents)
         elif filename.endswith(".pdf"):
@@ -542,7 +566,9 @@ async def analyze_document(
             return {
                 "error": f"Unsupported file type: {filename}. Please upload .docx or .pdf.",
             }
+        logger.info(f"Text extraction took {time.time() - t0:.4f}s")
     except Exception as e:
+        logger.error(f"Error extracting text: {e}")
         return {
             "error": f"Error extracting text: {str(e)}",
         }
@@ -550,7 +576,10 @@ async def analyze_document(
     if not full_text.strip():
         return {"error": "No readable text found in document."}
 
+    t0 = time.time()
     chunks = chunk_text(full_text)
+    logger.info(f"Chunking took {time.time() - t0:.4f}s, created {len(chunks)} chunks")
+    
     if not chunks:
         return {"error": "Document is too short to chunk."}
 
@@ -558,10 +587,13 @@ async def analyze_document(
     if len(chunks) > MAX_CHUNKS:
         chunks = chunks[:MAX_CHUNKS]
 
+    t0 = time.time()
     chunk_embeddings = get_embeddings(chunks, batch_size=32)
+    logger.info(f"Embedding generation took {time.time() - t0:.4f}s")
 
     results = []
 
+    t_inf_start = time.time()
     if policy.lower() == "all":
         for inv, pol in investor_policies.items():
             res = analyze_investor_single(
@@ -584,6 +616,8 @@ async def analyze_document(
             force_reason=(policy in csv_force_reason_investors),
         )
         results.append(res)
+    logger.info(f"Inference loop took {time.time() - t_inf_start:.4f}s")
+    logger.info(f"Total request took {time.time() - t_req_start:.4f}s")
 
     return {
         "filename": file.filename,
@@ -600,10 +634,15 @@ async def analyze_document_stream(
     file: UploadFile = File(...),
     policies: str = Form("all"),
 ):
-    print("Streaming request start")
+    t_req_start = time.time()
+    logger.info("Request start: /analyze-stream")
+    
+    t0 = time.time()
     contents = await file.read()
+    logger.info(f"File upload read took {time.time() - t0:.4f}s")
+    
     filename = (file.filename or "").lower()
-    print(filename)
+    logger.info(f"Processing filename: {filename}")
     base = os.path.splitext(os.path.basename(filename))[0]
     company_key = None
     if "autotrader" in base:
@@ -620,14 +659,16 @@ async def analyze_document_stream(
         csv_path = CSV_MAP.get(company_key)
         if csv_path and os.path.exists(csv_path):
             try:
+                t0 = time.time()
                 csv_force_reason_investors = load_company_against_investors_from_csv(csv_path)
-                print(f"[CSV] Matched {len(csv_force_reason_investors)} investors from {csv_path}")
+                logger.info(f"[CSV] Loaded {len(csv_force_reason_investors)} investors in {time.time() - t0:.4f}s")
             except Exception as _e:
-                print(f"[CSV] Failed to load {csv_path}: {_e}")
+                logger.error(f"[CSV] Failed to load {csv_path}: {_e}")
         else:
-            print(f"[CSV] No CSV available or path missing for company '{company_key}'")
+            logger.warning(f"[CSV] No CSV available or path missing for company '{company_key}'")
 
     try:
+        t0 = time.time()
         if filename.endswith(".docx"):
             full_text = extract_text_from_docx_bytes(contents)
         elif filename.endswith(".pdf"):
@@ -636,7 +677,9 @@ async def analyze_document_stream(
             return {
                 "error": f"Unsupported file type: {filename}. Please upload .docx or .pdf.",
             }
+        logger.info(f"Text extraction took {time.time() - t0:.4f}s")
     except Exception as e:
+        logger.error(f"Error extracting text: {e}")
         return {
             "error": f"Error extracting text: {str(e)}",
         }
@@ -644,7 +687,10 @@ async def analyze_document_stream(
     if not full_text.strip():
         return {"error": "No readable text found in document."}
 
+    t0 = time.time()
     chunks = chunk_text(full_text)
+    logger.info(f"Chunking took {time.time() - t0:.4f}s, created {len(chunks)} chunks")
+
     if not chunks:
         return {"error": "Document is too short to chunk."}
 
@@ -652,7 +698,9 @@ async def analyze_document_stream(
     if len(chunks) > MAX_CHUNKS:
         chunks = chunks[:MAX_CHUNKS]
 
+    t0 = time.time()
     chunk_embeddings = get_embeddings(chunks, batch_size=32)
+    logger.info(f"Embedding generation took {time.time() - t0:.4f}s")
 
     if not policies or policies.lower() == "all":
         investor_list = list(investor_policies.keys())
@@ -692,6 +740,7 @@ async def analyze_document_stream(
         }
         yield json.dumps({"type": "meta", "data": meta}) + "\n"
 
+        t_stream_start = time.time()
         for inv in investor_list:
             pol_text = investor_policies[inv]
             force_reason = inv in csv_force_reason_investors
@@ -720,6 +769,8 @@ async def analyze_document_stream(
                     ) + "\n"
                 yield json.dumps({"type": "reason-end", "investor": inv}) + "\n"
 
+        logger.info(f"Streaming loop finished in {time.time() - t_stream_start:.4f}s")
+        logger.info(f"Total streaming request took {time.time() - t_req_start:.4f}s")
         yield json.dumps({"type": "done"}) + "\n"
 
     return StreamingResponse(iter_results(), media_type="application/json")
