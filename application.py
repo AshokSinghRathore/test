@@ -1,6 +1,7 @@
 import torch
 import time
 import logging
+import sys
 
 from fastapi import FastAPI, Form, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
@@ -18,7 +19,15 @@ import re
 from typing import Optional, Set, Dict, List
 import json
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+# --- LOGGING SETUP ---
+# Force logs to output immediately (flush) so you see them in 'tail -f'
+logging.basicConfig(
+    level=logging.INFO, 
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ]
+)
 logger = logging.getLogger(__name__)
 
 try:
@@ -515,7 +524,11 @@ def healthz():
 
 @app.get("/investors")
 def investors():
-    return list(investor_policies.keys())
+    t_start = time.time()
+    logger.info("Request start: /investors")
+    keys = list(investor_policies.keys())
+    logger.info(f"Returning {len(keys)} investors. Took {time.time() - t_start:.4f}s")
+    return keys
 
 
 @app.post("/analyze")
