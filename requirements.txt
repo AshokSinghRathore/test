@@ -2,6 +2,9 @@ fastapi
 uvicorn[standard]
 numpy
 pandas
+torch
+transformers
+sentence-transformers
 openai
 python-docx
 pymupdf
@@ -9,10 +12,9 @@ pdfminer.six
 PyPDF2
 pytesseract
 Pillow
-python-multipart
+huggingface
+hf_transfer
 tqdm
 accelerate
-hf_transfer
-transformers==4.37.2
-sentence-transformers==2.5.1
+python-multipart
 scikit-learn
