@@ -1,4 +1,5 @@
 import torch
+torch.set_num_threads(1)
 import time
 import logging
 import sys
@@ -68,6 +69,12 @@ AGAINST_LABEL = 0
 FOR_LABEL = 1
 
 MAX_CHUNKS = int(os.getenv("MAX_CHUNKS", "10"))
+
+
+logger.info(f"AGAINST_THRESHOLD: {AGAINST_THRESHOLD}")
+logger.info(f"TOP_K: {TOP_K}")
+logger.info(f"MAX_CHUNKS: {MAX_CHUNKS}")
+logger.info(f"FLIP_LABELS: {FLIP_LABELS}")
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 logger.info(f"Running on device: {device}")
@@ -233,7 +240,7 @@ with torch.no_grad():
     if investor_policies:
         names = list(investor_policies.keys())
         texts = list(investor_policies.values())
-        vecs = get_embeddings(texts, batch_size=32)
+        vecs = get_embeddings(texts, batch_size=16)
         for name, vec in zip(names, vecs):
             INVESTOR_EMBS[name] = vec
 logger.info(f"Cached {len(INVESTOR_EMBS)} investor policies.")
