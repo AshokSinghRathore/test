@@ -1,6 +1,4 @@
 import torch
-torch.set_num_threads(1)
-
 import time
 import logging
 import sys
@@ -71,7 +69,7 @@ FOR_LABEL = 1
 
 MAX_CHUNKS = int(os.getenv("MAX_CHUNKS", "10"))
 
-device = "cpu"
+device = "cuda" if torch.cuda.is_available() else "cpu"
 logger.info(f"Running on device: {device}")
 
 logger.info("Loading models...")
@@ -207,7 +205,7 @@ def _mean_pool(last_hidden_state: torch.Tensor, attention_mask: torch.Tensor) ->
     return masked.sum(dim=1) / lengths
 
 @torch.no_grad()
-def get_embeddings(texts, batch_size: int = 16, max_length: int = 512):
+def get_embeddings(texts, batch_size: int = 32, max_length: int = 512):
     if not isinstance(texts, (list, tuple)):
         texts = [texts]
     all_vecs = []
@@ -228,6 +226,17 @@ def get_embeddings(texts, batch_size: int = 16, max_length: int = 512):
 
 def get_embedding(text: str):
     return get_embeddings([text])[0]
+
+logger.info("Pre-computing investor policy embeddings...")
+INVESTOR_EMBS: Dict[str, np.ndarray] = {}
+with torch.no_grad():
+    if investor_policies:
+        names = list(investor_policies.keys())
+        texts = list(investor_policies.values())
+        vecs = get_embeddings(texts, batch_size=32)
+        for name, vec in zip(names, vecs):
+            INVESTOR_EMBS[name] = vec
+logger.info(f"Cached {len(INVESTOR_EMBS)} investor policies.")
 
 app = FastAPI()
 
@@ -321,6 +330,7 @@ def predict_vote(policy: str, chunk: str, max_length: int = 512):
 
     ids = cls_tokenizer.build_inputs_with_special_tokens(p["input_ids"], c["input_ids"])
     token_type_ids = cls_tokenizer.create_token_type_ids_from_sequences(p["input_ids"], c["input_ids"])
+    
     if len(ids) > max_length:
         ids = ids[:max_length]
         token_type_ids = token_type_ids[:max_length]
@@ -436,7 +446,10 @@ def compute_investor_decision(
     chunk_embeddings: np.ndarray,
     force_reason: bool = False,
 ):
-    policy_emb = get_embedding(investor_policy)
+    policy_emb = INVESTOR_EMBS.get(name)
+    if policy_emb is None:
+        policy_emb = get_embedding(investor_policy)
+
     sims = chunk_embeddings @ policy_emb
     top_idx = np.argsort(sims)[-TOP_K:][::-1]
     top_chunks = [chunks[i] for i in top_idx]
@@ -567,7 +580,7 @@ async def analyze_document(
         chunks = chunks[:MAX_CHUNKS]
 
     t0 = time.time()
-    chunk_embeddings = get_embeddings(chunks, batch_size=16)
+    chunk_embeddings = get_embeddings(chunks, batch_size=32)
     logger.info(f"Embedding generation took {time.time() - t0:.4f}s")
 
     results = []
@@ -677,7 +690,7 @@ async def analyze_document_stream(
         chunks = chunks[:MAX_CHUNKS]
 
     t0 = time.time()
-    chunk_embeddings = get_embeddings(chunks, batch_size=16)
+    chunk_embeddings = get_embeddings(chunks, batch_size=32)
     logger.info(f"Embedding generation took {time.time() - t0:.4f}s")
 
     if not policies or policies.lower() == "all":
