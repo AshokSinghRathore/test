@@ -60,7 +60,7 @@ CLS_MODEL_NAME = os.getenv("CLS_MODEL_NAME", "Jaymin123321/Rem-Classifier")
 
 TOP_K = int(os.getenv("TOP_K", "20"))
 LOW_MARGIN = float(os.getenv("LOW_MARGIN", "0.1"))
-AGAINST_THRESHOLD = float(os.getenv("AGAINST_THRESHOLD", "0.01"))
+AGAINST_THRESHOLD = float(os.getenv("AGAINST_THRESHOLD", "0.05"))
 
 FLIP_LABELS = os.getenv("FLIP_LABELS", "1").strip() not in {"0", "false", "False", "no", "No"}
 
@@ -324,39 +324,47 @@ def chunk_text(text: str, max_tokens: int = 512, stride: int = 256, min_tokens: 
     return chunks
 
 @torch.no_grad()
-def predict_vote(policy: str, chunk: str, max_length: int = 512):
-    p = cls_tokenizer(policy, truncation=True, max_length=max_length // 2, add_special_tokens=False)
-    c = cls_tokenizer(chunk, truncation=True, max_length=max_length // 2, add_special_tokens=False)
+def predict_votes_batch(policy: str, chunks: List[str], max_length: int = 512):
+    if not chunks:
+        return []
 
-    ids = cls_tokenizer.build_inputs_with_special_tokens(p["input_ids"], c["input_ids"])
-    token_type_ids = cls_tokenizer.create_token_type_ids_from_sequences(p["input_ids"], c["input_ids"])
+    pairs = [[policy, c] for c in chunks]
+
+    inputs = cls_tokenizer(
+        pairs, 
+        padding=True, 
+        truncation=True, 
+        max_length=max_length, 
+        return_tensors="pt"
+    ).to(device)
+
+    logits = classifier_model(**inputs).logits
+
+    results = []
     
-    if len(ids) > max_length:
-        ids = ids[:max_length]
-        token_type_ids = token_type_ids[:max_length]
-    attention_mask = [1] * len(ids)
-
-    inputs = {
-        "input_ids": torch.tensor([ids], dtype=torch.long, device=device),
-        "attention_mask": torch.tensor([attention_mask], dtype=torch.long, device=device),
-        "token_type_ids": torch.tensor([token_type_ids], dtype=torch.long, device=device),
-    }
-    logits = classifier_model(**inputs).logits.squeeze(0)
-
     if NUM_LABELS == 1:
-        prob_against = torch.sigmoid(logits).item()
-        pred = AGAINST_LABEL if prob_against >= 0.5 else FOR_LABEL
+        probs = torch.sigmoid(logits).cpu().numpy().flatten()
+        for prob_against in probs:
+            pred = AGAINST_LABEL if prob_against >= 0.5 else FOR_LABEL
+            if FLIP_LABELS:
+                pred = FOR_LABEL if pred == AGAINST_LABEL else AGAINST_LABEL
+                prob_against = 1.0 - prob_against
+            results.append((pred, float(prob_against)))
     else:
-        probs = torch.softmax(logits, dim=-1)
-        prob_against = probs[AGAINST_INDEX].item()
-        prob_for = probs[FOR_INDEX].item()
-        pred = AGAINST_LABEL if prob_against >= prob_for else FOR_LABEL
-
-    if FLIP_LABELS:
-        pred = FOR_LABEL if pred == AGAINST_LABEL else AGAINST_LABEL
-        prob_against = 1.0 - prob_against
-
-    return pred, float(prob_against)
+        probs = torch.softmax(logits, dim=-1).cpu().numpy()
+        for i in range(len(chunks)):
+            prob_arr = probs[i]
+            prob_against = prob_arr[AGAINST_INDEX]
+            prob_for = prob_arr[FOR_INDEX]
+            pred = AGAINST_LABEL if prob_against >= prob_for else FOR_LABEL
+            
+            if FLIP_LABELS:
+                pred = FOR_LABEL if pred == AGAINST_LABEL else AGAINST_LABEL
+                prob_against = 1.0 - prob_against
+            
+            results.append((pred, float(prob_against)))
+            
+    return results
 
 def weighted_decision(scored, sims):
     votes = np.array([v for _, v, _ in scored], dtype=float)
@@ -455,7 +463,8 @@ def compute_investor_decision(
     top_chunks = [chunks[i] for i in top_idx]
     top_sims = sims[top_idx]
 
-    scored = [(c, *predict_vote(investor_policy, c)) for c in top_chunks]
+    batch_results = predict_votes_batch(investor_policy, top_chunks)
+    scored = [(top_chunks[i], pred, prob) for i, (pred, prob) in enumerate(batch_results)]
     
     maj, conf, frac_against, mean_prob_against = weighted_decision(scored, top_sims)
 
