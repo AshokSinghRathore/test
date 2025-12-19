@@ -53,7 +53,7 @@ except Exception:
 USERNAME = os.getenv("APP_USERNAME", "JayminShah")
 PASSWORD = os.getenv("APP_PASSWORD", "Password1")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4-turbo")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
 
 EMBED_MODEL_NAME = os.getenv("EMBED_MODEL_NAME", "sentence-transformers/all-MiniLM-L6-v2")
 CLS_MODEL_NAME = os.getenv("CLS_MODEL_NAME", "Jaymin123321/Rem-Classifier")
