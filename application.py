@@ -76,7 +76,8 @@ logger.info(f"TOP_K: {TOP_K}")
 logger.info(f"MAX_CHUNKS: {MAX_CHUNKS}")
 logger.info(f"FLIP_LABELS: {FLIP_LABELS}")
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
+# device = "cuda" if torch.cuda.is_available() else "cpu"
+device = "cpu"
 logger.info(f"Running on device: {device}")
 
 logger.info("Loading models...")
