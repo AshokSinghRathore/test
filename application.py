@@ -1,4 +1,6 @@
 import torch
+torch.set_num_threads(1)
+
 import time
 import logging
 import sys
@@ -69,7 +71,7 @@ FOR_LABEL = 1
 
 MAX_CHUNKS = int(os.getenv("MAX_CHUNKS", "10"))
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
+device = "cpu"
 logger.info(f"Running on device: {device}")
 
 logger.info("Loading models...")
@@ -205,7 +207,7 @@ def _mean_pool(last_hidden_state: torch.Tensor, attention_mask: torch.Tensor) ->
     return masked.sum(dim=1) / lengths
 
 @torch.no_grad()
-def get_embeddings(texts, batch_size: int = 32, max_length: int = 512):
+def get_embeddings(texts, batch_size: int = 16, max_length: int = 512):
     if not isinstance(texts, (list, tuple)):
         texts = [texts]
     all_vecs = []
@@ -226,17 +228,6 @@ def get_embeddings(texts, batch_size: int = 32, max_length: int = 512):
 
 def get_embedding(text: str):
     return get_embeddings([text])[0]
-
-logger.info("Pre-computing investor policy embeddings...")
-INVESTOR_EMBS: Dict[str, np.ndarray] = {}
-with torch.no_grad():
-    if investor_policies:
-        names = list(investor_policies.keys())
-        texts = list(investor_policies.values())
-        vecs = get_embeddings(texts, batch_size=32)
-        for name, vec in zip(names, vecs):
-            INVESTOR_EMBS[name] = vec
-logger.info(f"Cached {len(INVESTOR_EMBS)} investor policies.")
 
 app = FastAPI()
 
@@ -324,47 +315,38 @@ def chunk_text(text: str, max_tokens: int = 512, stride: int = 256, min_tokens: 
     return chunks
 
 @torch.no_grad()
-def predict_votes_batch(policy: str, chunks: List[str], max_length: int = 512):
-    if not chunks:
-        return []
+def predict_vote(policy: str, chunk: str, max_length: int = 512):
+    p = cls_tokenizer(policy, truncation=True, max_length=max_length // 2, add_special_tokens=False)
+    c = cls_tokenizer(chunk, truncation=True, max_length=max_length // 2, add_special_tokens=False)
 
-    pairs = [[policy, c] for c in chunks]
+    ids = cls_tokenizer.build_inputs_with_special_tokens(p["input_ids"], c["input_ids"])
+    token_type_ids = cls_tokenizer.create_token_type_ids_from_sequences(p["input_ids"], c["input_ids"])
+    if len(ids) > max_length:
+        ids = ids[:max_length]
+        token_type_ids = token_type_ids[:max_length]
+    attention_mask = [1] * len(ids)
 
-    inputs = cls_tokenizer(
-        pairs, 
-        padding=True, 
-        truncation=True, 
-        max_length=max_length, 
-        return_tensors="pt"
-    ).to(device)
+    inputs = {
+        "input_ids": torch.tensor([ids], dtype=torch.long, device=device),
+        "attention_mask": torch.tensor([attention_mask], dtype=torch.long, device=device),
+        "token_type_ids": torch.tensor([token_type_ids], dtype=torch.long, device=device),
+    }
+    logits = classifier_model(**inputs).logits.squeeze(0)
 
-    logits = classifier_model(**inputs).logits
-
-    results = []
-    
     if NUM_LABELS == 1:
-        probs = torch.sigmoid(logits).cpu().numpy().flatten()
-        for prob_against in probs:
-            pred = AGAINST_LABEL if prob_against >= 0.5 else FOR_LABEL
-            if FLIP_LABELS:
-                pred = FOR_LABEL if pred == AGAINST_LABEL else AGAINST_LABEL
-                prob_against = 1.0 - prob_against
-            results.append((pred, float(prob_against)))
+        prob_against = torch.sigmoid(logits).item()
+        pred = AGAINST_LABEL if prob_against >= 0.5 else FOR_LABEL
     else:
-        probs = torch.softmax(logits, dim=-1).cpu().numpy()
-        for i in range(len(chunks)):
-            prob_arr = probs[i]
-            prob_against = prob_arr[AGAINST_INDEX]
-            prob_for = prob_arr[FOR_INDEX]
-            pred = AGAINST_LABEL if prob_against >= prob_for else FOR_LABEL
-            
-            if FLIP_LABELS:
-                pred = FOR_LABEL if pred == AGAINST_LABEL else AGAINST_LABEL
-                prob_against = 1.0 - prob_against
-            
-            results.append((pred, float(prob_against)))
-            
-    return results
+        probs = torch.softmax(logits, dim=-1)
+        prob_against = probs[AGAINST_INDEX].item()
+        prob_for = probs[FOR_INDEX].item()
+        pred = AGAINST_LABEL if prob_against >= prob_for else FOR_LABEL
+
+    if FLIP_LABELS:
+        pred = FOR_LABEL if pred == AGAINST_LABEL else AGAINST_LABEL
+        prob_against = 1.0 - prob_against
+
+    return pred, float(prob_against)
 
 def weighted_decision(scored, sims):
     votes = np.array([v for _, v, _ in scored], dtype=float)
@@ -454,17 +436,13 @@ def compute_investor_decision(
     chunk_embeddings: np.ndarray,
     force_reason: bool = False,
 ):
-    policy_emb = INVESTOR_EMBS.get(name)
-    if policy_emb is None:
-        policy_emb = get_embedding(investor_policy)
-
+    policy_emb = get_embedding(investor_policy)
     sims = chunk_embeddings @ policy_emb
     top_idx = np.argsort(sims)[-TOP_K:][::-1]
     top_chunks = [chunks[i] for i in top_idx]
     top_sims = sims[top_idx]
 
-    batch_results = predict_votes_batch(investor_policy, top_chunks)
-    scored = [(top_chunks[i], pred, prob) for i, (pred, prob) in enumerate(batch_results)]
+    scored = [(c, *predict_vote(investor_policy, c)) for c in top_chunks]
     
     maj, conf, frac_against, mean_prob_against = weighted_decision(scored, top_sims)
 
@@ -589,7 +567,7 @@ async def analyze_document(
         chunks = chunks[:MAX_CHUNKS]
 
     t0 = time.time()
-    chunk_embeddings = get_embeddings(chunks, batch_size=32)
+    chunk_embeddings = get_embeddings(chunks, batch_size=16)
     logger.info(f"Embedding generation took {time.time() - t0:.4f}s")
 
     results = []
@@ -699,7 +677,7 @@ async def analyze_document_stream(
         chunks = chunks[:MAX_CHUNKS]
 
     t0 = time.time()
-    chunk_embeddings = get_embeddings(chunks, batch_size=32)
+    chunk_embeddings = get_embeddings(chunks, batch_size=16)
     logger.info(f"Embedding generation took {time.time() - t0:.4f}s")
 
     if not policies or policies.lower() == "all":
