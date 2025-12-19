@@ -67,7 +67,7 @@ FLIP_LABELS = os.getenv("FLIP_LABELS", "1").strip() not in {"0", "false", "False
 AGAINST_LABEL = 0
 FOR_LABEL = 1
 
-MAX_CHUNKS = int(os.getenv("MAX_CHUNKS", "300"))
+MAX_CHUNKS = int(os.getenv("MAX_CHUNKS", "10"))
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 logger.info(f"Running on device: {device}")
